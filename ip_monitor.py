@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+"""
+【プログラム名】ip_monitor.py
+【役割】
+  Raspberry PiのIPアドレスおよび接続中Wi-Fi（SSID）を監視し、
+  起動時やネットワーク切り替え時にDiscordへWebhook経由で自動通知する。
+
+【動作仕様】
+  1. ~/cansat_config.env からDiscord Webhook URLと機体名を取得する。
+  2. 外部通信（8.8.8.8）ルートから自身の有効なIPアドレスを検出する。
+  3. NetworkManager (nmcli) から現在アクティブなWi-FiのSSIDを取得する。
+  4. IPアドレスまたはSSIDの変化を検知した際、Discordへフォーマット済みメッセージを送信する。
+  5. 設定ファイルが存在しない場合や未接続時は待機し、エラーで落ちずに常駐を継続する。
+"""
+
 import socket
 import time
 import json
@@ -19,8 +33,8 @@ def load_config():
                     if line and not line.startswith("#") and "=" in line:
                         k, v = line.split("=", 1)
                         config[k.strip()] = v.strip().strip('"').strip("'")
-        except Exception as e:
-            print(f"Config load error: {e}")
+        except Exception:
+            pass
     return config
 
 def get_current_ip():
@@ -74,8 +88,8 @@ def send_notification(ip, ssid, reason="接続"):
     )
     try:
         urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        print(f"送信失敗: {e}")
+    except Exception:
+        pass
 
 def main():
     last_ip, last_ssid = None, None
