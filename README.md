@@ -4,13 +4,13 @@ Raspberry Pi Zero 2 W の起動時やネットワーク切り替え時に、現�
 
 ---
 
-## よく使う操作（日常運用）
+## 🥫 よく使う操作（日常運用）
 
-SSHログイン後、短縮コマンド `cs`（またはフルパス）を実行してマネージャーを起動します。
+SSHログイン後、短縮コマンド `cs` を入力してマネージャーを起動します。
 
 ```bash
 cs
-# または: ~/cansat/config_manager.sh
+# エイリアス未設定の場合: bash ~/cansat/config_manager.sh
 ```
 
 ### 主なメニュー操作
@@ -26,9 +26,9 @@ cs
 
 ---
 
-## プログラムの最新化（コード更新）
+## 🔄 プログラムの最新化（コード更新）
 
-PC側でGitHubの共通コードを更新した場合、ラズパイ側で以下を実行するだけで最新版に同期されます（個人のWi-Fi設定やWebhook URLは保持されます）。
+PC側でGitHubの共通コードを更新した場合、ラズパイ側で以下を実行するだけで最新版に同期されます（個人のWi-Fi設定やWebhook URL、エイリアス設定は保持されます）。
 
 ```bash
 cd ~/cansat
@@ -38,11 +38,11 @@ sudo systemctl restart ip-monitor.service
 
 ---
 
-## 初回セットアップ手順（新しいmicroSDカード作成時のみ）
+## 🛠 初回セットアップ手順（新しいmicroSDカード作成時）
 
-新しい環境や別の機体をセットアップする際、最初に一度だけ実行する手順です。
+新しいmicroSDカードを作成した際、最初に一度だけ実行する手順です。
 
-### 1. リポジトリの取得と認証情報の保存
+### 1. リポジトリ取得と実行権限の付与
 
 ```bash
 # 認証情報をSDカード内に保存（2回目以降のトークン入力を省略）
@@ -53,13 +53,20 @@ git clone [https://github.com/sho3ca/cansat-network-monitor.git](https://github.
 
 # 実行権限を付与
 chmod +x ~/cansat/*.py ~/cansat/*.sh
+```
 
-# 短縮コマンド（cs）の登録
+### 2. 短縮コマンド（エイリアス）の登録
+
+どこからでも `cs` と打つだけでマネージャーが起動できるように設定します（`git pull` しても消去されません）。
+
+```bash
 echo "alias cs='bash ~/cansat/config_manager.sh'" >> ~/.bashrc
 source ~/.bashrc
 ```
 
-### 2. バックグラウンド自動起動（systemd）の登録
+### 3. バックグラウンド自動起動（systemd）の登録
+
+OS起動時に自動でIP監視スクリプトが動くようサービス登録します。
 
 ```bash
 sudo bash -c 'cat << "EOF" > /etc/systemd/system/ip-monitor.service
@@ -86,7 +93,37 @@ sudo systemctl start ip-monitor.service
 
 ---
 
-## ファイル構成と役割
+## 💡 便利コマンド集（後から使えるチートシート）
+
+SSH接続中のターミナル（PowerShell経由等）で実行すると役立つコマンド群です。
+
+### 1. コード更新＆サービス再起動の一括短縮コマンド（`cs-update`）
+1単語打つだけで `git pull` とサービスの再起動を完了させたい場合に追加します。
+
+```bash
+echo "alias cs-update='cd ~/cansat && git pull && sudo systemctl restart ip-monitor.service && cd -'" >> ~/.bashrc
+source ~/.bashrc
+```
+* 登録後は **`cs-update`** と打つだけで自動アップデートが完了します。
+
+### 2. 登録済みエイリアスの確認
+`~/.bashrc` に設定が正しく入っているか確認します。
+
+```bash
+grep "alias cs" ~/.bashrc
+```
+
+### 3. 常駐サービスの動作ログリアルタイム確認
+通知がDiscordに届かない場合、リアルタイムで何が起きているかを確認します。
+
+```bash
+journalctl -u ip-monitor.service -f
+# （終了時は Ctrl + C）
+```
+
+---
+
+## 📁 ファイル構成と役割
 
 | ファイル名 | 役割 | 管理場所 |
 | :--- | :--- | :--- |
@@ -94,3 +131,4 @@ sudo systemctl start ip-monitor.service
 | `ip_monitor.py` | ネットワーク監視とDiscord通知を実行する常駐スクリプト | GitHub（共通） |
 | `.gitignore` | 個人設定ファイルをGit管理から除外する設定 | GitHub（共通） |
 | `~/cansat_config.env` | Discord Webhook URLや機体名が保存される個人設定ファイル | 各自のmicroSD内（非公開） |
+| `~/.bashrc` | `cs` などの短縮コマンド（エイリアス）が保存される設定 | 各自のOS環境内（非公開） |
