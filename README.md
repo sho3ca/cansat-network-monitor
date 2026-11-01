@@ -80,7 +80,7 @@ sudo systemctl start ip-monitor.service
 ## ファイル構成と役割
 
 | ファイル名 | 役割 | 管理場所 |
-
+| :--- | :--- | :--- |
 | `config_manager.sh` | Wi-Fi追加・削除・スキャンやDiscord設定を行う対話型ツール | GitHub（共通） |
 | `ip_monitor.py` | ネットワーク監視とDiscord通知を実行する常駐スクリプト | GitHub（共通） |
 | `.gitignore` | 個人設定ファイルをGit管理から除外する設定 | GitHub（共通） |
