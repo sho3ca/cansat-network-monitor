@@ -1,0 +1,3 @@
+cansat_config.env
+*.env
+*.txt
