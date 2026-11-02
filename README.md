@@ -1,12 +1,12 @@
 # CanSat ネットワーク監視 & 自動通知システム
 
-Raspberry Pi Zero 2 W の起動時やネットワーク切り替え時に、現在の接続先Wi-Fi（SSID）とIPアドレスをDiscordへ自動通知するシステムです。
+Raspberry Pi Zero 2 W の起動時やネットワーク切り替え時に、現在の接続先Wi-Fi（SSID）とIPアドレスをDiscordへ自動通知するシステム
 
 ---
 
-## 🥫 よく使う操作（日常運用）
+## 🥫 主な操作
 
-SSHログイン後、短縮コマンド `cs` を入力してマネージャーを起動します。
+SSHログイン後、短縮コマンド `cs` を入力してマネージャーを起動
 
 ```bash
 cs
@@ -28,7 +28,7 @@ cs
 
 ## 🔄 プログラムの最新化（コード更新）
 
-PC側でGitHubの共通コードを更新した場合、ラズパイ側で以下を実行するだけで最新版に同期されます（個人のWi-Fi設定やWebhook URL、エイリアス設定は保持されます）。
+PC側でGitHubの共通コードを更新した場合、ラズパイ側で以下を実行するだけで最新版に同期される（個人のWi-Fi設定やWebhook URL、エイリアス設定は保持される）。
 
 ```bash
 cd ~/cansat
@@ -40,7 +40,7 @@ sudo systemctl restart ip-monitor.service
 
 ## 🛠 初回セットアップ手順（新しいmicroSDカード作成時）
 
-新しいmicroSDカードを作成した際、最初に一度だけ実行する手順です。
+新しいmicroSDカードを作成した際、最初に一度だけ実行する手順
 
 ### 1. リポジトリ取得と実行権限の付与
 
@@ -55,9 +55,9 @@ git clone [https://github.com/sho3ca/cansat-network-monitor.git](https://github.
 chmod +x ~/cansat/*.py ~/cansat/*.sh
 ```
 
-### 2. 短縮コマンド（エイリアス）の登録
+### 2. 短縮コマンド（エイリアス）の登録（任意）
 
-どこからでも `cs` と打つだけでマネージャーが起動できるように設定します（`git pull` しても消去されません）。
+どこからでも `cs` と打つだけでマネージャーが起動できるように設定できる（`git pull` しても消去されない）。
 
 ```bash
 echo "alias cs='bash ~/cansat/config_manager.sh'" >> ~/.bashrc
@@ -66,7 +66,7 @@ source ~/.bashrc
 
 ### 3. バックグラウンド自動起動（systemd）の登録
 
-OS起動時に自動でIP監視スクリプトが動くようサービス登録します。
+OS起動時に自動でIP監視スクリプトが動くようサービス登録する
 
 ```bash
 sudo bash -c 'cat << "EOF" > /etc/systemd/system/ip-monitor.service
@@ -93,28 +93,28 @@ sudo systemctl start ip-monitor.service
 
 ---
 
-## 💡 便利コマンド集（後から使えるチートシート）
+## 💡 便利コマンド集
 
-SSH接続中のターミナル（PowerShell経由等）で実行すると役立つコマンド群です。
+SSH接続中のターミナル（PowerShell経由等）で実行すると役立つコマンド群
 
 ### 1. コード更新＆サービス再起動の一括短縮コマンド（`cs-update`）
-1単語打つだけで `git pull` とサービスの再起動を完了させたい場合に追加します。
+`cs-update`と打つだけで `git pull` とサービスの再起動を完了させたい場合は追加
 
 ```bash
 echo "alias cs-update='cd ~/cansat && git pull && sudo systemctl restart ip-monitor.service && cd -'" >> ~/.bashrc
 source ~/.bashrc
 ```
-* 登録後は **`cs-update`** と打つだけで自動アップデートが完了します。
+* 登録後は **`cs-update`** と打つだけで自動アップデートが完了する
 
 ### 2. 登録済みエイリアスの確認
-`~/.bashrc` に設定が正しく入っているか確認します。
+`~/.bashrc` に設定が正しく入っているか確認できる
 
 ```bash
 grep "alias cs" ~/.bashrc
 ```
 
 ### 3. 常駐サービスの動作ログリアルタイム確認
-通知がDiscordに届かない場合、リアルタイムで何が起きているかを確認します。
+通知がDiscordに届かない場合、リアルタイムで何が起きているかを確認できる
 
 ```bash
 journalctl -u ip-monitor.service -f
