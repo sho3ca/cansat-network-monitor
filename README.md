@@ -35,7 +35,11 @@ cd ~/cansat
 git pull
 sudo systemctl restart ip-monitor.service
 ```
+以下のように一回でつなげて実行も可能
 
+```bash
+(cd ~/cansat && git pull) && sudo systemctl restart ip-monitor.service
+```
 ---
 
 ## 🛠 初回セットアップ手順（新しいmicroSDカード作成時）
