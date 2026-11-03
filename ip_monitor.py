@@ -104,7 +104,7 @@ def main():
                 last_ssid = current_ssid
         else:
             last_ip, last_ssid = None, None
-        time.sleep(5)
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()
