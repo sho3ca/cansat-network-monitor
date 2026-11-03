@@ -16,10 +16,10 @@ show_menu() {
     echo "=========================================="
     echo "1)  現在の設定と登録済みWi-Fi一覧を確認する"
     echo "2)  Discord Webhook URLを設定・変更する"
-    echo "3)  新しいWi-Fiを追加・接続する"
+    echo "3)  新しいWi-Fiを追加する（安全登録・スキャン選択対応）"
     echo "4)  Wi-Fiの優先度（優先順位）を変更する"
     echo "5)  不要なWi-Fi設定を削除する"
-    echo "6)  指定したWi-Fiへ今すぐ接続テストする"
+    echo "6)  指定したWi-Fiへ手動接続テストする（ロールバック付き）"
     echo "7)  周囲のWi-Fi電波をスキャンする"
     echo "8)  機体名（識別名）を変更する"
     echo "9)  Discord通知サービスの稼働状態・ログを確認する"
@@ -58,36 +58,75 @@ while true; do
             ;;
         3)
             echo ""
-            echo "--- 新規Wi-Fi登録・接続 ---"
-            read -p "追加するWi-FiのSSID: " ssid
+            echo "--- Wi-Fi追加モードの選択 ---"
+            echo "1) 今すぐ接続を切らずに【設定だけ事前登録】する（★テザリング追加に最も安全）"
+            echo "2) 周囲の電波をスキャンして【一覧から選んで登録・接続】する"
+            echo "3) SSIDを手入力して登録・接続を試みる"
+            read -p "選択 [1-3] (キャンセルは0): " add_mode
+
+            target_ssid=""
+            if [ "$add_mode" = "1" ] || [ "$add_mode" = "3" ]; then
+                read -p "追加するWi-FiのSSID: " target_ssid
+            elif [ "$add_mode" = "2" ]; then
+                echo "周囲のWi-Fiをスキャン中..."
+                sudo nmcli dev wifi rescan > /dev/null 2>&1
+                mapfile -t scanned_ssids < <(nmcli -t -f SSID dev wifi list | grep -v '^$' | awk '!seen[$0]++')
+                if [ ${#scanned_ssids[@]} -eq 0 ]; then
+                    echo "周囲に電波が見つかりませんでした。スマホのテザリング画面を開いた状態で再試行してください。"
+                    continue
+                fi
+                echo "--- 検出されたSSID ---"
+                for i in "${!scanned_ssids[@]}"; do
+                    echo "$((i+1))) ${scanned_ssids[$i]}"
+                done
+                read -p "接続する番号を選択: " sel_num
+                if [[ "$sel_num" =~ ^[0-9]+$ ]] && [ "$sel_num" -ge 1 ] && [ "$sel_num" -le "${#scanned_ssids[@]}" ]; then
+                    target_ssid="${scanned_ssids[$((sel_num-1))]}"
+                else
+                    echo "=> キャンセルしました。"
+                    continue
+                fi
+            else
+                continue
+            fi
+
+            [ -z "$target_ssid" ] && echo "SSIDが空です。" && continue
+
             read -s -p "Wi-Fiパスワード: " pass
             echo ""
-            read -p "自動接続優先度 (例: 自宅=10, 優先したいテザリング=20) [デフォルト: 10]: " prio
-            prio=${prio:-10}
+            read -p "自動接続優先度 (例: 自宅=10, 優先したいテザリング=20) [デフォルト: 20]: " prio
+            prio=${prio:-20}
 
-            # 既存の同名プロファイルを完全クリーンアップ
-            sudo nmcli connection delete id "$ssid" > /dev/null 2>&1
+            # 既存同名プロファイルのクリーンアップ
+            sudo nmcli connection delete id "$target_ssid" > /dev/null 2>&1
 
-            echo "Wi-Fi電波をスキャンして接続を試行中..."
-            sudo nmcli dev wifi rescan > /dev/null 2>&1
-            sleep 1
-
-            # パスワード暗号方式（WPA2/WPA3）を自動判定して接続プロファイルを作成
-            if sudo nmcli dev wifi connect "$ssid" password "$pass" ifname wlan0 name "$ssid"; then
-                sudo nmcli connection modify "$ssid" connection.autoconnect-priority "$prio"
-                sudo nmcli connection modify "$ssid" connection.autoconnect yes
-                echo "=> 成功: Wi-Fi「$ssid」(優先度: $prio) を登録し、正常に接続しました。"
-            else
-                echo ""
-                echo "【接続試行で失敗した場合のフォールバック】"
-                echo "現在周囲に電波がない（事前登録）と判定し、静的プロファイルとして保存します..."
-                
-                if sudo nmcli connection add type wifi ifname wlan0 con-name "$ssid" ssid "$ssid" \
-                    wifi-sec.psk "$pass" connection.autoconnect-priority "$prio" connection.autoconnect yes; then
-                    echo "=> プロファイル「$ssid」(優先度: $prio) を事前登録しました。"
-                    echo "   ※ 電波圏内に入り次第、自動接続されます。"
+            if [ "$add_mode" = "1" ]; then
+                # 【安全策】現在の接続を一切切断せず、NetworkManagerプロファイルのみ追加
+                if sudo nmcli connection add type wifi ifname wlan0 con-name "$target_ssid" ssid "$target_ssid" \
+                    wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$pass" connection.autoconnect-priority "$prio" connection.autoconnect yes; then
+                    echo "=> 成功: 「$target_ssid」(優先度: $prio) を事前登録しました。"
+                    echo "   ※ 現在のSSH接続は維持されています。テザリング圏内に入り次第、自動接続されます。"
                 else
                     echo "=> エラー: プロファイルの作成に失敗しました。"
+                fi
+            else
+                # 【接続試行】切断時に直前のWi-Fiへ戻すロールバック保護付き
+                current_wifi=$(nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d: -f2)
+                echo "15秒の接続テストを開始します（失敗時は自動で「$current_wifi」へ復帰します）..."
+                
+                (
+                    sleep 15
+                    if ! ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && ! ping -c 1 -W 2 192.168.0.1 >/dev/null 2>&1; then
+                        [ -n "$current_wifi" ] && sudo nmcli connection up "$current_wifi" >/dev/null 2>&1
+                    fi
+                ) &
+
+                if sudo nmcli dev wifi connect "$target_ssid" password "$pass" ifname wlan0 name "$target_ssid"; then
+                    sudo nmcli connection modify "$target_ssid" connection.autoconnect-priority "$prio"
+                    sudo nmcli connection modify "$target_ssid" connection.autoconnect yes
+                    echo "=> 成功: 「$target_ssid」への接続に成功しました。"
+                else
+                    echo "=> 接続に失敗したため、元の設定を保持しました。"
                 fi
             fi
             ;;
@@ -147,7 +186,15 @@ while true; do
             read -p "接続テストしたい番号を入力: " conn_num
             if [[ "$conn_num" =~ ^[0-9]+$ ]] && [ "$conn_num" -ge 1 ] && [ "$conn_num" -le "${#wifi_conns[@]}" ]; then
                 selected_conn="${wifi_conns[$((conn_num-1))]}"
-                echo "「$selected_conn」への接続を試みます..."
+                current_wifi=$(nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d: -f2)
+                echo "「$selected_conn」への接続を試みます（15秒応答なしで「$current_wifi」へロールバック）..."
+                
+                (
+                    sleep 15
+                    if ! ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && ! ping -c 1 -W 2 192.168.0.1 >/dev/null 2>&1; then
+                        [ -n "$current_wifi" ] && sudo nmcli connection up "$current_wifi" >/dev/null 2>&1
+                    fi
+                ) &
                 sudo nmcli connection up "$selected_conn"
             else
                 echo "無効な番号です。"
