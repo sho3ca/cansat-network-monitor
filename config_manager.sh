@@ -2,21 +2,8 @@
 # ==============================================================================
 # 【プログラム名】config_manager.sh
 # 【役割】
-#   Raspberry Piのネットワーク設定（Wi-Fi追加/削除/優先度変更/スキャン/接続切替）および
-#   個人用設定ファイル（~/cansat_config.env）の管理を対話的に行うCLIツール。
-#
-# 【主な機能】
-#   [1] 設定値・登録済みWi-Fi（優先度順）・接続状態の確認
-#   [2] Discord Webhook URLの登録・更新
-#   [3] 新規Wi-Fiプロファイルの登録（優先度指定対応）
-#   [4] 既存Wi-Fiプロファイルの優先度変更（新規追加）
-#   [5] 不要なWi-Fiプロファイルの削除
-#   [6] 指定Wi-Fiへの手動接続テスト
-#   [7] 周囲のWi-Fi電波スキャン表示
-#   [8] 機体識別名（DEVICE_NAME）の変更
-#   [9] Discord通知サービスの稼働状態・ログ確認
-#   [10] 設定ファイル（cansat_config.env）のnano直接編集
-#   [0] 終了
+#    Raspberry Piのネットワーク設定（Wi-Fi追加/削除/優先度変更/スキャン/接続切替）および
+#    個人用設定ファイル（~/cansat_config.env）の管理を対話的に行うCLIツール。
 # ==============================================================================
 
 CONFIG_PATH="$HOME/cansat_config.env"
@@ -29,7 +16,7 @@ show_menu() {
     echo "=========================================="
     echo "1)  現在の設定と登録済みWi-Fi一覧を確認する"
     echo "2)  Discord Webhook URLを設定・変更する"
-    echo "3)  新しいWi-Fiを追加する"
+    echo "3)  新しいWi-Fiを追加・接続する"
     echo "4)  Wi-Fiの優先度（優先順位）を変更する"
     echo "5)  不要なWi-Fi設定を削除する"
     echo "6)  指定したWi-Fiへ今すぐ接続テストする"
@@ -71,17 +58,38 @@ while true; do
             ;;
         3)
             echo ""
+            echo "--- 新規Wi-Fi登録・接続 ---"
             read -p "追加するWi-FiのSSID: " ssid
             read -s -p "Wi-Fiパスワード: " pass
             echo ""
-            read -p "自動接続優先度 (例: 自宅=10, 優先したいテザリング=20): " prio
+            read -p "自動接続優先度 (例: 自宅=10, 優先したいテザリング=20) [デフォルト: 10]: " prio
             prio=${prio:-10}
 
-            sudo nmcli connection delete "$ssid" > /dev/null 2>&1
-            sudo nmcli connection add type wifi ifname wlan0 con-name "$ssid" \
-              ssid "$ssid" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$pass" \
-              connection.autoconnect-priority "$prio"
-            echo "=> Wi-Fi「$ssid」(優先度: $prio) を登録しました。"
+            # 既存の同名プロファイルを完全クリーンアップ
+            sudo nmcli connection delete id "$ssid" > /dev/null 2>&1
+
+            echo "Wi-Fi電波をスキャンして接続を試行中..."
+            sudo nmcli dev wifi rescan > /dev/null 2>&1
+            sleep 1
+
+            # パスワード暗号方式（WPA2/WPA3）を自動判定して接続プロファイルを作成
+            if sudo nmcli dev wifi connect "$ssid" password "$pass" ifname wlan0 name "$ssid"; then
+                sudo nmcli connection modify "$ssid" connection.autoconnect-priority "$prio"
+                sudo nmcli connection modify "$ssid" connection.autoconnect yes
+                echo "=> 成功: Wi-Fi「$ssid」(優先度: $prio) を登録し、正常に接続しました。"
+            else
+                echo ""
+                echo "【接続試行で失敗した場合のフォールバック】"
+                echo "現在周囲に電波がない（事前登録）と判定し、静的プロファイルとして保存します..."
+                
+                if sudo nmcli connection add type wifi ifname wlan0 con-name "$ssid" ssid "$ssid" \
+                    wifi-sec.psk "$pass" connection.autoconnect-priority "$prio" connection.autoconnect yes; then
+                    echo "=> プロファイル「$ssid」(優先度: $prio) を事前登録しました。"
+                    echo "   ※ 電波圏内に入り次第、自動接続されます。"
+                else
+                    echo "=> エラー: プロファイルの作成に失敗しました。"
+                fi
+            fi
             ;;
         4)
             echo ""
