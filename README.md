@@ -99,7 +99,31 @@ grep "alias cs" ~/.bashrc
 ```bash
 journalctl -u ip-monitor.service -f  # （終了時は Ctrl + C）
 ```
+---
 
+## ⚠️ ローカルの変更を破棄して完全同期する（強制リセット）
+
+ラズパイ側で誤ってファイルを書き換えてしまったり、コンフリクト等でうまく更新できない場合は、ローカルの変更をすべて破棄してGitHub（リモート）の最新状態へ強制的に同期させることができる
+
+※ 他のディレクトリからクローンした別リポジトリや、ホーム直下の設定ファイル（~/cansat_config.env）には一切影響しない
+
+```bash
+cd ~/cansat
+
+# 1. ローカルの未追跡ファイルや手動変更を完全に消去
+git reset --hard HEAD
+git clean -fd
+
+# 2. GitHubの最新情報を取得
+git fetch origin main
+
+# 3. リモートの最新状態に合わせて強制上書き一致
+git reset --hard origin/main
+
+# 4. 実行権限を再付与し、監視サービスを再起動
+chmod +x setup.sh config_manager.sh ip_monitor.py
+sudo systemctl restart ip-monitor.service
+```
 ---
 
 ## 📁 ファイル構成と役割
