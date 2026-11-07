@@ -1,237 +1,265 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ==============================================================================
-# 【プログラム名】config_manager.sh
-# 【役割】
-#    Raspberry Piのネットワーク設定（Wi-Fi追加/削除/優先度変更/スキャン/接続切替）および
-#    個人用設定ファイル（~/cansat_config.env）の管理を対話的に行うCLIツール。
-# ==============================================================================
+# プログラム名: config_manager.sh
+# 概要:
+#   CanSat 運用現場における NetworkManager (Wi-Fi) および機体設定の対話型管理 CLI。
+#
+# 主な機能・設計方針:
+#   1. Wi-Fi 管理:
+#      - 事前登録モード (SSH 接続を切断せずに遠征用テザリング等を登録)
+#      - 自動接続優先度 (0〜100) の変更および不要設定の削除
+#      - 15秒ロールバック保護付きの接続テスト (閉域網スマホ親機の GW 判定を含む)
+#   2. 実験用 一時固定モード:
+#      - nmcli --temporary を使用し、対象 Wi-Fi 以外の自動接続をメモリ上でのみ無効化
+#      - autoconnect-retries 0 (無限再試行) と最優先度 (100) を適用 (上空投下復帰対策)
+#      - ディスクを変更しないため、ラズパイの電源 OFF または再起動で自動的に通常状態へ復元
+#   3. 機体設定 & Discord 連携:
+#      - ~/cansat_config.env のアトミック更新 (特殊文字による破損を防止)
+#      - Webhook 設定、テスト通知送信、ip-monitor.service の状態確認
+#   4. 操作性 (UX):
+#      - 0 入力またはキャンセル時は確認待ち (Enter) をスキップして即座にメニュー復帰
+# ==============================================================================set -uo pipefail
 
-CONFIG_PATH="$HOME/cansat_config.env"
-[ ! -f "$CONFIG_PATH" ] && touch "$CONFIG_PATH"
+readonly SERVICE_NAME='ip-monitor.service'
+readonly CONFIG_PATH="${CONFIG_PATH:-${HOME}/cansat_config.env}"
+readonly ROLLBACK_SEC=15
+WIFI_IFACE=""
 
-show_menu() {
-    echo ""
-    echo "=========================================="
-    echo " CanSat ネットワーク & 設定マネージャー"
-    echo "=========================================="
-    echo "1)  現在の設定と登録済みWi-Fi一覧を確認する"
-    echo "2)  Discord Webhook URLを設定・変更する"
-    echo "3)  新しいWi-Fiを追加する（安全登録・スキャン選択対応）"
-    echo "4)  Wi-Fiの優先度（優先順位）を変更する"
-    echo "5)  不要なWi-Fi設定を削除する"
-    echo "6)  指定したWi-Fiへ手動接続テストする（ロールバック付き）"
-    echo "7)  周囲のWi-Fi電波をスキャンする"
-    echo "8)  機体名（識別名）を変更する"
-    echo "9)  Discord通知サービスの稼働状態・ログを確認する"
-    echo "10) 設定ファイルを直接編集する (nano)"
-    echo "0)  終了"
-    echo "=========================================="
-    read -p "番号を選択してください [0-10]: " choice
+# --- 共通ユーティリティ ---
+get_wifi_iface() {
+    [[ -z "$WIFI_IFACE" ]] && WIFI_IFACE="$(nmcli -t -f DEVICE,TYPE dev status 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')"
+    [[ -z "$WIFI_IFACE" ]] && { echo "エラー: Wi-Fiインターフェースが見つかりません。" >&2; return 1; }
 }
 
+list_wifi() {
+    nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless"{print $1}'
+}
+
+get_current_conn() {
+    get_wifi_iface || return 1
+    nmcli -g GENERAL.CONNECTION,GENERAL.CON-UUID dev show "$WIFI_IFACE" 2>/dev/null | tr '\n' '\t'
+}
+
+set_config_env() {
+    local key="$1" val="$2"
+    touch "$CONFIG_PATH" && chmod 600 "$CONFIG_PATH"
+    grep -v "^${key}=" "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" 2>/dev/null || true
+    echo "${key}=\"${val}\"" >> "${CONFIG_PATH}.tmp"
+    mv -f "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
+    chmod 600 "$CONFIG_PATH"
+}
+
+get_config_env() {
+    grep "^${1}=" "$CONFIG_PATH" 2>/dev/null | head -n1 | cut -d'=' -f2- | tr -d '"'
+}
+
+# 外部1.1.1.1 またはローカルゲートウェイ（閉域テザリング親機）への疎通確認
+check_connectivity() {
+    ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && return 0
+    local gw
+    gw="$(ip route show dev "${WIFI_IFACE:-wlan0}" 2>/dev/null | awk '/default/{print $3; exit}')"
+    [[ -n "$gw" ]] && ping -c1 -W2 "$gw" >/dev/null 2>&1
+}
+
+# リスト選択（0入力時は戻り値 2 で即時キャンセル）
+select_wifi_profile() {
+    local -n out_var=$1
+    local prompt_msg="$2"
+    mapfile -t _profiles < <(list_wifi)
+    ((${#_profiles[@]} == 0)) && { echo "登録済みWi-Fiがありません。"; return 2; }
+    
+    echo "$prompt_msg"
+    for i in "${!_profiles[@]}"; do echo "$((i+1))) ${_profiles[$i]}"; done
+    echo "0) キャンセル"
+    read -r -p "番号を選択: " sel
+    [[ "$sel" =~ ^[1-9][0-9]*$ ]] && ((sel <= ${#_profiles[@]})) && { out_var="${_profiles[$((sel-1))]}"; return 0; }
+    echo "キャンセルしました。"; return 2
+}
+
+restart_service() {
+    sudo systemctl restart "$SERVICE_NAME" 2>/dev/null && echo "監視サービスを再起動しました。"
+}
+
+# --- メニュー機能 ---
+action_status() {
+    echo "=== 設定 & 接続状態 ==="
+    [[ -s "$CONFIG_PATH" ]] && awk '/^DISCORD_WEBHOOK=/{print "DISCORD_WEBHOOK=\"(設定済み)\""; next} {print}' "$CONFIG_PATH" || echo "(設定なし)"
+    echo -e "\n--- 登録済みWi-Fi (優先度順) ---"
+    while IFS= read -r p; do
+        prio=$(nmcli -g connection.autoconnect-priority connection show id "$p" 2>/dev/null || echo 0)
+        retries=$(nmcli -g connection.autoconnect-retries connection show id "$p" 2>/dev/null || echo -1)
+        printf "%-3s [再試行: %-2s] %s\n" "${prio:-0}" "$([ "$retries" = "0" ] && echo '無限' || echo "$retries")" "$p"
+    done < <(list_wifi) | sort -rn
+    
+    echo -e "\n--- 現在の通信状態 ---"
+    get_wifi_iface && {
+        curr=$(get_current_conn)
+        echo "接続中SSID : ${curr%%$'\t'*}"
+        ip -4 -o addr show dev "$WIFI_IFACE" 2>/dev/null | awk '{split($4, a, "/"); print "IPアドレス : " a[1]}'
+    }
+}
+
+action_add_wifi() {
+    get_wifi_iface || return 1
+    echo "1) 事前登録 (現在の接続を維持)  2) 電波スキャンから接続  3) SSID手入力  0) キャンセル"
+    read -r -p "選択 [0-3]: " mode
+    [[ ! "$mode" =~ ^[1-3]$ ]] && { echo "キャンセルしました。"; return 2; }
+
+    local ssid="" pass="" prio=20
+    if [[ "$mode" == "2" ]]; then
+        echo "スキャン中..." && sudo nmcli dev wifi rescan ifname "$WIFI_IFACE" 2>/dev/null && sleep 1
+        mapfile -t ssids < <(nmcli --terse --fields SSID dev wifi list ifname "$WIFI_IFACE" 2>/dev/null | awk 'NF && !seen[$0]++')
+        for i in "${!ssids[@]}"; do echo "$((i+1))) ${ssids[$i]}"; done
+        echo "0) キャンセル"; read -r -p "選択: " s_idx
+        [[ "$s_idx" =~ ^[1-9][0-9]*$ ]] && ((s_idx <= ${#ssids[@]})) && ssid="${ssids[$((s_idx-1))]}" || { echo "キャンセルしました。"; return 2; }
+    else
+        read -r -p "SSIDを入力 (キャンセルは0): " ssid
+        [[ -z "$ssid" || "$ssid" == "0" ]] && { echo "キャンセルしました。"; return 2; }
+    fi
+
+    read -r -p "パスワード (キャンセルは0): " pass
+    [[ -z "$pass" || "$pass" == "0" ]] && { echo "キャンセルしました。"; return 2; }
+
+    read -r -p "優先度 (0-100) [既定 20]: " p_in
+    if [[ -n "$p_in" ]]; then
+        [[ "$p_in" =~ ^[0-9]+$ ]] && ((p_in >= 0 && p_in <= 100)) && prio="$p_in" || echo "不正な値のため既定値(20)を使用します。"
+    fi
+
+    if [[ "$mode" == "1" ]]; then
+        sudo nmcli connection add type wifi ifname "$WIFI_IFACE" con-name "$ssid" ssid "$ssid" \
+            wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$pass" connection.autoconnect yes connection.autoconnect-priority "$prio" >/dev/null 2>&1
+        echo "「$ssid」を事前登録しました。"
+    else
+        curr_uuid="$(get_current_conn | awk -F'\t' '{print $2}')"
+        ( sleep "$ROLLBACK_SEC"
+          if ! check_connectivity; then
+              echo -e "\n疎通確認失敗のため旧Wi-Fiに復帰します。" >&2
+              [[ -n "$curr_uuid" ]] && sudo nmcli connection up uuid "$curr_uuid" >/dev/null 2>&1
+          fi ) &
+        if sudo nmcli dev wifi connect "$ssid" password "$pass" ifname "$WIFI_IFACE" name "$ssid"; then
+            sudo nmcli connection modify id "$ssid" connection.autoconnect-priority "$prio" 2>/dev/null || true
+            echo "接続成功。"
+        else
+            echo "接続失敗。元に戻します。" && return 1
+        fi
+    fi
+}
+
+action_change_priority() {
+    local target np
+    select_wifi_profile target "優先度を変更するWi-Fiを選択:" || return 2
+    read -r -p "新しい優先度 (0-100, キャンセルは空Enter): " np
+    [[ "$np" =~ ^[0-9]+$ ]] && ((np >= 0 && np <= 100)) && sudo nmcli connection modify id "$target" connection.autoconnect-priority "$np" && echo "更新完了。" || { echo "キャンセルまたは不正な値です。"; return 2; }
+}
+
+action_delete_wifi() {
+    local target yn
+    select_wifi_profile target "削除するWi-Fiを選択:" || return 2
+    read -r -p "「$target」を削除しますか? [y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]] && sudo nmcli connection delete id "$target" && echo "削除完了。" || { echo "キャンセルしました。"; return 2; }
+}
+
+action_test_conn() {
+    local target curr_uuid
+    select_wifi_profile target "接続テストするWi-Fiを選択:" || return 2
+    curr_uuid="$(get_current_conn | awk -F'\t' '{print $2}')"
+    ( sleep "$ROLLBACK_SEC"; check_connectivity || [[ -z "$curr_uuid" ]] || sudo nmcli connection up uuid "$curr_uuid" >/dev/null 2>&1 ) &
+    sudo nmcli connection up id "$target" ifname "$WIFI_IFACE"
+}
+
+action_lock_temporary() {
+    local curr ssid yn
+    curr=$(get_current_conn)
+    ssid="${curr%%$'\t'*}"
+    [[ -z "$ssid" ]] && { echo "Wi-Fi未接続です。"; return 1; }
+    echo "対象: $ssid (他Wi-Fi無効化・無限再試行・優先度100を適用)"
+    read -r -p "適用しますか? (再起動で自動リセット) [y/N]: " yn
+    [[ ! "$yn" =~ ^[Yy]$ ]] && { echo "キャンセルしました。"; return 2; }
+
+    while IFS= read -r p; do
+        [[ "$p" != "$ssid" ]] && sudo nmcli connection modify --temporary id "$p" connection.autoconnect no 2>/dev/null
+    done < <(list_wifi)
+    sudo nmcli connection modify --temporary id "$ssid" connection.autoconnect yes connection.autoconnect-priority 100 connection.autoconnect-retries 0 2>/dev/null
+    echo "「$ssid」に一時固定しました。"
+}
+
+action_unlock_temporary() {
+    sudo nmcli connection reload && echo "一時固定を解除し、通常設定に戻しました。"
+}
+
+action_scan() {
+    get_wifi_iface || return 1
+    sudo nmcli dev wifi rescan ifname "$WIFI_IFACE" 2>/dev/null && sleep 1
+    nmcli -f IN-USE,SSID,CHAN,SIGNAL,SECURITY dev wifi list ifname "$WIFI_IFACE"
+}
+
+action_set_webhook() {
+    local url yn
+    echo "1) 新しいURLを入力・変更  0) キャンセル"
+    read -r -p "選択 [0-1]: " sel
+    [[ "$sel" != "1" ]] && { echo "キャンセルしました。"; return 2; }
+
+    read -r -p "Discord Webhook URLを入力 (キャンセルは0): " url
+    [[ -z "$url" || "$url" == "0" ]] && { echo "キャンセルしました。"; return 2; }
+    if [[ "$url" =~ ^https://discord\.com/api/webhooks/ ]]; then
+        read -r -p "保存してサービスを再起動しますか? [y/N]: " yn
+        [[ "$yn" =~ ^[Yy]$ ]] && set_config_env "DISCORD_WEBHOOK" "$url" && restart_service || { echo "キャンセルしました。"; return 2; }
+    else
+        echo "エラー: Webhook URLの形式が正しくありません。"
+    fi
+}
+
+action_test_webhook() {
+    local url name code
+    url=$(get_config_env "DISCORD_WEBHOOK")
+    name=$(get_config_env "DEVICE_NAME"); name="${name:-CanSat}"
+    [[ -z "$url" ]] && { echo "Webhook未設定です。"; return 1; }
+    code=$(curl -s -o /dev/null -w "%{http_code}" -H "Content-Type: application/json" -d "{\"content\":\"[${name}] テスト通知成功\"}" "$url")
+    [ "$code" = "204" ] && echo "送信成功 (204)" || echo "送信失敗 ($code)"
+}
+
+action_set_name() {
+    local curr n yn
+    curr="$(get_config_env "DEVICE_NAME")"
+    echo "現在の機体名: ${curr:-未設定}"
+    echo "1) 機体名を変更  0) キャンセル"
+    read -r -p "選択 [0-1]: " sel
+    [[ "$sel" != "1" ]] && { echo "キャンセルしました。"; return 2; }
+
+    read -r -p "新しい機体名 (キャンセルは0): " n
+    [[ -z "$n" || "$n" == "0" ]] && { echo "キャンセルしました。"; return 2; }
+    read -r -p "「$n」に変更しますか? [y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]] && set_config_env "DEVICE_NAME" "$n" && restart_service || { echo "キャンセルしました。"; return 2; }
+}
+
+# --- メインループ ---
+readonly MENU=(
+    "状態確認:action_status"
+    "Wi-Fi追加 (事前登録/接続):action_add_wifi"
+    "優先度変更:action_change_priority"
+    "Wi-Fi削除:action_delete_wifi"
+    "接続テスト (ロールバック付):action_test_conn"
+    "【実験用】現在Wi-Fiに一時固定 (再起動でリセット):action_lock_temporary"
+    "【実験用】一時固定解除:action_unlock_temporary"
+    "電波スキャン:action_scan"
+    "Webhook URL設定:action_set_webhook"
+    "Discord通知テスト:action_test_webhook"
+    "機体名変更:action_set_name"
+    "サービスログ確認:journalctl -u $SERVICE_NAME -n 10 --no-pager"
+)
+
 while true; do
-    show_menu
-    case $choice in
-        1)
-            echo ""
-            echo "--- 設定ファイルの内容 ($CONFIG_PATH) ---"
-            cat "$CONFIG_PATH"
-            echo ""
-            echo "--- 登録済みWi-Fi一覧（優先度が高い順） ---"
-            nmcli -f NAME,AUTOCONNECT-PRIORITY,TYPE connection show | grep wifi | sort -k2 -nr
-            echo ""
-            echo "--- 現在の接続状態 ---"
-            nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d: -f2 | awk '{print "接続中SSID: "$0}'
-            hostname -I | awk '{print "現在IP: "$1}'
-            ;;
-        2)
-            echo ""
-            read -p "DiscordのWebhook URLを入力: " url
-            if [[ "$url" =~ ^https://discord\.com/api/webhooks/ ]]; then
-                sed -i '/^DISCORD_WEBHOOK=/d' "$CONFIG_PATH"
-                echo "DISCORD_WEBHOOK=\"$url\"" >> "$CONFIG_PATH"
-                echo "=> Discord URLを更新しました。"
-                sudo systemctl restart ip-monitor.service > /dev/null 2>&1
-            else
-                echo "エラー: 有効なWebhook URLではありません。"
-            fi
-            ;;
-        3)
-            echo ""
-            echo "--- Wi-Fi追加モードの選択 ---"
-            echo "1) 今すぐ接続を切らずに【設定だけ事前登録】する（★テザリング追加に最も安全）"
-            echo "2) 周囲の電波をスキャンして【一覧から選んで登録・接続】する"
-            echo "3) SSIDを手入力して登録・接続を試みる"
-            read -p "選択 [1-3] (キャンセルは0): " add_mode
-
-            target_ssid=""
-            if [ "$add_mode" = "1" ] || [ "$add_mode" = "3" ]; then
-                read -p "追加するWi-FiのSSID: " target_ssid
-            elif [ "$add_mode" = "2" ]; then
-                echo "周囲のWi-Fiをスキャン中..."
-                sudo nmcli dev wifi rescan > /dev/null 2>&1
-                mapfile -t scanned_ssids < <(nmcli -t -f SSID dev wifi list | grep -v '^$' | awk '!seen[$0]++')
-                if [ ${#scanned_ssids[@]} -eq 0 ]; then
-                    echo "周囲に電波が見つかりませんでした。スマホのテザリング画面を開いた状態で再試行してください。"
-                    continue
-                fi
-                echo "--- 検出されたSSID ---"
-                for i in "${!scanned_ssids[@]}"; do
-                    echo "$((i+1))) ${scanned_ssids[$i]}"
-                done
-                read -p "接続する番号を選択: " sel_num
-                if [[ "$sel_num" =~ ^[0-9]+$ ]] && [ "$sel_num" -ge 1 ] && [ "$sel_num" -le "${#scanned_ssids[@]}" ]; then
-                    target_ssid="${scanned_ssids[$((sel_num-1))]}"
-                else
-                    echo "=> キャンセルしました。"
-                    continue
-                fi
-            else
-                continue
-            fi
-
-            [ -z "$target_ssid" ] && echo "SSIDが空です。" && continue
-
-            read -s -p "Wi-Fiパスワード: " pass
-            echo ""
-            read -p "自動接続優先度 (例: 自宅=10, 優先したいテザリング=20) [デフォルト: 20]: " prio
-            prio=${prio:-20}
-
-            # 既存同名プロファイルのクリーンアップ
-            sudo nmcli connection delete id "$target_ssid" > /dev/null 2>&1
-
-            if [ "$add_mode" = "1" ]; then
-                # 【安全策】現在の接続を一切切断せず、NetworkManagerプロファイルのみ追加
-                if sudo nmcli connection add type wifi ifname wlan0 con-name "$target_ssid" ssid "$target_ssid" \
-                    wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$pass" connection.autoconnect-priority "$prio" connection.autoconnect yes; then
-                    echo "=> 成功: 「$target_ssid」(優先度: $prio) を事前登録しました。"
-                    echo "   ※ 現在のSSH接続は維持されています。テザリング圏内に入り次第、自動接続されます。"
-                else
-                    echo "=> エラー: プロファイルの作成に失敗しました。"
-                fi
-            else
-                # 【接続試行】切断時に直前のWi-Fiへ戻すロールバック保護付き
-                current_wifi=$(nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d: -f2)
-                echo "15秒の接続テストを開始します（失敗時は自動で「$current_wifi」へ復帰します）..."
-                
-                (
-                    sleep 15
-                    if ! ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && ! ping -c 1 -W 2 192.168.0.1 >/dev/null 2>&1; then
-                        [ -n "$current_wifi" ] && sudo nmcli connection up "$current_wifi" >/dev/null 2>&1
-                    fi
-                ) &
-
-                if sudo nmcli dev wifi connect "$target_ssid" password "$pass" ifname wlan0 name "$target_ssid"; then
-                    sudo nmcli connection modify "$target_ssid" connection.autoconnect-priority "$prio"
-                    sudo nmcli connection modify "$target_ssid" connection.autoconnect yes
-                    echo "=> 成功: 「$target_ssid」への接続に成功しました。"
-                else
-                    echo "=> 接続に失敗したため、元の設定を保持しました。"
-                fi
-            fi
-            ;;
-        4)
-            echo ""
-            echo "--- 優先度を変更するWi-Fiを選択 ---"
-            mapfile -t wifi_list < <(nmcli -t -f NAME,TYPE connection show | grep ':802-11-wireless$' | cut -d: -f1)
-            if [ ${#wifi_list[@]} -eq 0 ]; then
-                echo "登録されているWi-Fiプロファイルはありません。"
-            else
-                for i in "${!wifi_list[@]}"; do
-                    current_prio=$(nmcli -g connection.autoconnect-priority connection show "${wifi_list[$i]}" 2>/dev/null)
-                    echo "$((i+1))) ${wifi_list[$i]} (現在の優先度: ${current_prio:-0})"
-                done
-                read -p "番号を選択してください (キャンセルは0): " prio_num
-                if [[ "$prio_num" =~ ^[0-9]+$ ]] && [ "$prio_num" -ge 1 ] && [ "$prio_num" -le "${#wifi_list[@]}" ]; then
-                    target_wifi="${wifi_list[$((prio_num-1))]}"
-                    read -p "新しい優先度を入力 (数値が大きいほど優先 / 例: 自宅=10, テザリング=20): " new_prio
-                    if [[ "$new_prio" =~ ^-?[0-9]+$ ]]; then
-                        sudo nmcli connection modify "$target_wifi" connection.autoconnect-priority "$new_prio"
-                        echo "=> 「$target_wifi」の優先度を $new_prio に更新しました。"
-                    else
-                        echo "エラー: 半角数字を入力してください。"
-                    fi
-                else
-                    echo "=> キャンセルしました。"
-                fi
-            fi
-            ;;
-        5)
-            echo ""
-            echo "--- 削除可能なWi-Fi一覧 ---"
-            mapfile -t wifi_list < <(nmcli -t -f NAME,TYPE connection show | grep ':802-11-wireless$' | cut -d: -f1)
-            if [ ${#wifi_list[@]} -eq 0 ]; then
-                echo "登録されているWi-Fiプロファイルはありません。"
-            else
-                for i in "${!wifi_list[@]}"; do
-                    echo "$((i+1))) ${wifi_list[$i]}"
-                done
-                read -p "削除したいWi-Fiの番号を入力 (キャンセルは0): " del_num
-                if [[ "$del_num" =~ ^[0-9]+$ ]] && [ "$del_num" -ge 1 ] && [ "$del_num" -le "${#wifi_list[@]}" ]; then
-                    target_name="${wifi_list[$((del_num-1))]}"
-                    sudo nmcli connection delete "$target_name"
-                    echo "=> Wi-Fi設定「$target_name」を削除しました。"
-                else
-                    echo "=> 削除をキャンセルしました。"
-                fi
-            fi
-            ;;
-        6)
-            echo ""
-            echo "--- 接続テスト可能なWi-Fi一覧 ---"
-            mapfile -t wifi_conns < <(nmcli -t -f NAME,TYPE connection show | grep ':802-11-wireless$' | cut -d: -f1)
-            for i in "${!wifi_conns[@]}"; do
-                echo "$((i+1))) ${wifi_conns[$i]}"
-            done
-            read -p "接続テストしたい番号を入力: " conn_num
-            if [[ "$conn_num" =~ ^[0-9]+$ ]] && [ "$conn_num" -ge 1 ] && [ "$conn_num" -le "${#wifi_conns[@]}" ]; then
-                selected_conn="${wifi_conns[$((conn_num-1))]}"
-                current_wifi=$(nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d: -f2)
-                echo "「$selected_conn」への接続を試みます（15秒応答なしで「$current_wifi」へロールバック）..."
-                
-                (
-                    sleep 15
-                    if ! ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && ! ping -c 1 -W 2 192.168.0.1 >/dev/null 2>&1; then
-                        [ -n "$current_wifi" ] && sudo nmcli connection up "$current_wifi" >/dev/null 2>&1
-                    fi
-                ) &
-                sudo nmcli connection up "$selected_conn"
-            else
-                echo "無効な番号です。"
-            fi
-            ;;
-        7)
-            echo ""
-            echo "周囲のWi-Fi電波をスキャン中..."
-            sudo nmcli dev wifi rescan > /dev/null 2>&1
-            sudo nmcli -f IN-USE,SSID,MODE,CHAN,RATE,SIGNAL,SECURITY dev wifi list
-            ;;
-        8)
-            echo ""
-            read -p "機体名を入力 (例: CanSat-Rover-01): " dev_name
-            sed -i '/^DEVICE_NAME=/d' "$CONFIG_PATH"
-            echo "DEVICE_NAME=\"$dev_name\"" >> "$CONFIG_PATH"
-            echo "=> 機体名を「$dev_name」に更新しました。"
-            sudo systemctl restart ip-monitor.service > /dev/null 2>&1
-            ;;
-        9)
-            echo ""
-            echo "--- サービス状態 ---"
-            systemctl is-active ip-monitor.service | awk '{print "稼働状況: "$0}'
-            echo ""
-            echo "--- 最新のログ（直近10行） ---"
-            journalctl -u ip-monitor.service -n 10 --no-pager
-            ;;
-        10)
-            nano "$CONFIG_PATH"
-            sudo systemctl restart ip-monitor.service > /dev/null 2>&1
-            ;;
-        0)
-            echo "終了します。"
-            exit 0
-            ;;
-        *)
-            echo "0から10の数字を入力してください。"
-            ;;
-    esac
+    echo -e "\n=== CanSat ネットワーク管理 ==="
+    for i in "${!MENU[@]}"; do printf "%2d) %s\n" "$((i+1))" "${MENU[$i]%%:*}"; done
+    echo " 0) 終了"
+    read -r -p "選択 [0-${#MENU[@]}]: " c
+    [[ "$c" == "0" ]] && exit 0
+    if [[ "$c" =~ ^[0-9]+$ ]] && ((c >= 1 && c <= ${#MENU[@]})); then
+        echo ""
+        ${MENU[$((c-1))]##*:}
+        ret_code=$?
+        if ((ret_code != 2)); then
+            read -r -p "Enterでメニューへ戻る..." _dummy
+        fi
+    fi
 done
