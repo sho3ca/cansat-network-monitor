@@ -81,29 +81,11 @@ cs-update
 ```bash
 (cd ~/cansat && git pull) && sudo systemctl restart ip-monitor.service
 ```
-
----
-
-## 💡 便利コマンド集
-
-SSH接続中のターミナルで役立つコマンド群。
-
-### 1. 登録済みエイリアスの確認
-~/.bashrc に設定が正しく入っているか確認できる。
-```bash
-grep "alias cs" ~/.bashrc
-```
-
-### 2. 常駐サービスの動作ログリアルタイム確認
-通知がDiscordに届かない場合、リアルタイムで何が起きているかを確認できる。
-```bash
-journalctl -u ip-monitor.service -f  # （終了時は Ctrl + C）
-```
 ---
 
 ## ⚠️ ローカルの変更を破棄して完全同期する（強制リセット）
 
-ラズパイ側で誤ってファイルを書き換えてしまったり、コンフリクト等でうまく更新できない場合は、ローカルの変更をすべて破棄してGitHub（リモート）の最新状態へ強制的に同期させることができる
+ラズパイ側で誤ってファイルを書き換えてしまったり、コンフリクト等でうまく更新できない場合は、ローカルの変更をすべて破棄してGitHub（リモート）の最新状態へ強制的に同期させることができる（これやっとけば大体どうにかなる）
 
 ※ 他のディレクトリからクローンした別リポジトリや、ホーム直下の設定ファイル（~/cansat_config.env）には一切影響しない
 
@@ -123,6 +105,23 @@ git reset --hard origin/main
 # 4. 実行権限を再付与し、監視サービスを再起動
 chmod +x setup.sh config_manager.sh ip_monitor.py
 sudo systemctl restart ip-monitor.service
+```
+---
+
+## 💡 便利コマンド集
+
+SSH接続中のターミナルで役立つコマンド群。
+
+### 1. 登録済みエイリアスの確認
+~/.bashrc に設定が正しく入っているか確認できる。
+```bash
+grep "alias cs" ~/.bashrc
+```
+
+### 2. 常駐サービスの動作ログリアルタイム確認
+通知がDiscordに届かない場合、リアルタイムで何が起きているかを確認できる。
+```bash
+journalctl -u ip-monitor.service -f  # （終了時は Ctrl + C）
 ```
 ---
 
